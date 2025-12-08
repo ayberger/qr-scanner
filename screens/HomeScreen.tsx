@@ -6,6 +6,7 @@ import {
   StyleSheet,
   Image,
   Alert,
+  Platform,
 } from 'react-native';
 import {
   Camera,
@@ -17,6 +18,80 @@ import { useCodeScanner } from 'react-native-vision-camera';
 import type { RootStackParamList, ScanMode } from '../App';
 import { useHistoryStore } from '../context/HistoryContext';
 import Icon from 'react-native-vector-icons/FontAwesome';
+import { OCR_SPACE_API_KEY } from '@env';
+
+const uploadImageToOcr = async (imagePath: string): Promise<string> => {
+  // Android'de çoğu zaman file:// prefix'i gerekiyor
+  const uri =
+    Platform.OS === 'android' && !imagePath.startsWith('file:')
+      ? `file://${imagePath}`
+      : imagePath;
+
+  const formData = new FormData();
+
+  // 📁 Dökümana uygun dosya alanı
+  formData.append('file', {
+    uri,
+    name: 'document.jpg',
+    type: 'image/jpeg',
+  } as any);
+
+  // 🔤 Dil ayarı (Türkçe için 3 harfli kod: "tur")
+  formData.append('language', 'tur');
+
+  // 🧠 Engine, scale, orientation parametreleri
+  formData.append('OCREngine', '2');          // Foto için genelde daha iyi
+  formData.append('scale', 'true');           // Düşük çözünürlükte iyileştirir
+  formData.append('detectOrientation', 'true');
+
+  const response = await fetch('https://api.ocr.space/parse/image', {
+    method: 'POST',
+    headers: {
+      apikey: OCR_SPACE_API_KEY,             // 🔑 API key artık HEADER'da
+    },
+    body: formData,
+  });
+
+  console.log('OCR HTTP STATUS:', response.status);
+
+  if (!response.ok) {
+    const text = await response.text();
+    console.log('OCR HTTP ERROR BODY:', text);
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  const json = await response.json();
+  console.log('OCR RAW JSON:', JSON.stringify(json, null, 2));
+
+  if (json.IsErroredOnProcessing) {
+    const err =
+      json.ErrorMessage?.toString?.() ||
+      json.ErrorDetails?.toString?.() ||
+      'OCR.space işlem hatası';
+    console.log('OCR PROCESSING ERROR:', err);
+    throw new Error(err);
+  }
+
+  const results = json.ParsedResults as any[] | undefined;
+
+  if (!results || results.length === 0) {
+    console.log('OCR boş ParsedResults döndürdü.');
+    return '';
+  }
+
+  const parsedText = results
+    .map((r: any) => (r.ParsedText || '').trim())
+    .filter((t: string) => t.length > 0)
+    .join('\n')
+    .trim();
+
+  console.log('OCR PARSED TEXT:', parsedText);
+
+  return parsedText;
+};
+
+
+
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Home'>;
 
@@ -33,6 +108,8 @@ const HomeScreen: React.FC<Props> = ({ navigation, route }) => {
 
   const { addItem } = useHistoryStore();
   const isFocused = useIsFocused();
+  const [lastScannedCode, setLastScannedCode] = useState<string | null>(null);
+
 
   const codeScanner = useCodeScanner({
     codeTypes: ['qr', 'ean-13', 'ean-8', 'code-128'], // QR + Barkod destekli
@@ -40,14 +117,7 @@ const HomeScreen: React.FC<Props> = ({ navigation, route }) => {
       const value = codes[0]?.value;
       if (!value) return;
 
-      // History kaydı
-      addItem(mode, value);
-
-      if (mode === 'qr') Alert.alert('QR OKUNDU', value);
-      if (mode === 'barcode') Alert.alert('BARKOD OKUNDU', value);
-
-      // Gerekirse otomatik reset
-      // setMode('qr');
+      setLastScannedCode(value);
     },
   });
 
@@ -115,8 +185,59 @@ const HomeScreen: React.FC<Props> = ({ navigation, route }) => {
         const now = new Date().toLocaleString('tr-TR');
 
         if (mode === 'document') {
-          addItem('document', photo.path);
-          Alert.alert('Belge Kaydedildi', 'Belge resmi kaydedildi.');
+          try {
+            // Fotoğrafı OCR API'ye gönder
+            const extractedText = (await uploadImageToOcr((photo.path))).trim();
+
+            if (!extractedText) {
+              // Metin bulunamadı → yine de kayıt al
+              addItem(
+                'document',
+                'Metin bulunamadı (sadece görsel kaydedildi, daha net bir fotoğrafla tekrar dene).',
+              );
+              Alert.alert(
+                'Metin bulunamadı',
+                'Belge üzerinde okunabilir bir metin tespit edilemedi. Daha net bir fotoğrafla tekrar deneyebilirsin.',
+              );
+            } else {
+              // Metin bulundu → History'ye yaz
+              addItem('document', extractedText);
+              Alert.alert(
+                'Belge okundu',
+                'Belgenin üzerindeki metin History’e kaydedildi.',
+              );
+            }
+          } catch (e) {
+            console.error('OCR API hata:', e);
+            addItem('document', 'OCR sırasında bir hata oluştu.');
+            Alert.alert(
+              'OCR hatası',
+              'Belge okunurken bir hata oluştu. Daha sonra tekrar dene.',
+            );
+          }
+
+          // document modu için akış burada bitiyor, diğer "else if (mode === 'qr' ...)" kısmına düşmesin
+          return;
+        }
+
+        else if (mode === 'qr' || mode === 'barcode') {
+        // QR / Barkod modu: o anda taranan kodu history'e kaydet
+          if (!lastScannedCode) {
+            Alert.alert(
+              'Kod Bulunamadı',
+              'Çerçeve içinde bir QR veya barkod yok gibi görünüyor.'
+            );
+          } else {
+            addItem(mode, lastScannedCode);
+
+            Alert.alert(
+              mode === 'qr' ? 'QR Kaydedildi' : 'Barkod Kaydedildi',
+              lastScannedCode
+            );
+
+          // İstersen aynı kodu tekrar kaydetmemek için sıfırlayabilirsin
+            setLastScannedCode(null);
+          }
         }
       } catch (error) {
         console.error(error);
@@ -125,7 +246,7 @@ const HomeScreen: React.FC<Props> = ({ navigation, route }) => {
         setIsCapturing(false);
       }
     },
-    [addItem, device, hasPermission, mode]
+    [addItem, device, hasPermission, mode, lastScannedCode]
   );
 
   const getModeTitle = () => {
@@ -289,7 +410,7 @@ const styles = StyleSheet.create({
     marginTop: 32,
     borderRadius: 24,
     overflow: 'hidden',
-    height: 260,
+    height: 550,
     backgroundColor: '#000',
   },
   scanFrame: {
