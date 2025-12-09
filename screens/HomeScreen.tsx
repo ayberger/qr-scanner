@@ -7,6 +7,7 @@ import {
   Image,
   Alert,
   Platform,
+  Vibration,      
 } from 'react-native';
 import {
   Camera,
@@ -19,6 +20,10 @@ import type { RootStackParamList, ScanMode } from '../App';
 import { useHistoryStore } from '../context/HistoryContext';
 import Icon from 'react-native-vector-icons/FontAwesome';
 import { OCR_SPACE_API_KEY } from '@env';
+import { showNotification } from '../utils/notification';
+import notifee from '@notifee/react-native';
+
+
 
 const uploadImageToOcr = async (imagePath: string): Promise<string> => {
   // Android'de çoğu zaman file:// prefix'i gerekiyor
@@ -91,8 +96,6 @@ const uploadImageToOcr = async (imagePath: string): Promise<string> => {
 };
 
 
-
-
 type Props = NativeStackScreenProps<RootStackParamList, 'Home'>;
 
 const HomeScreen: React.FC<Props> = ({ navigation, route }) => {
@@ -102,6 +105,7 @@ const HomeScreen: React.FC<Props> = ({ navigation, route }) => {
   // kamera izni
   const [hasPermission, setHasPermission] = useState<boolean | null>(null);
   const [isCapturing, setIsCapturing] = useState(false);
+  const [isModeMenuVisible, setIsModeMenuVisible] = useState(false);
 
   const device = useCameraDevice('back');
   const cameraRef = useRef<Camera | null>(null);
@@ -109,17 +113,61 @@ const HomeScreen: React.FC<Props> = ({ navigation, route }) => {
   const { addItem } = useHistoryStore();
   const isFocused = useIsFocused();
   const [lastScannedCode, setLastScannedCode] = useState<string | null>(null);
+  const lastScanTimeRef = useRef<number | null>(null);
+  const isProcessingRef = useRef(false);
 
 
   const codeScanner = useCodeScanner({
     codeTypes: ['qr', 'ean-13', 'ean-8', 'code-128'], // QR + Barkod destekli
-    onCodeScanned: (codes) => {
-      const value = codes[0]?.value;
+    onCodeScanned: async (codes) => {
+      const value = codes[0]?.value?.trim();
       if (!value) return;
 
-      setLastScannedCode(value);
+      if (mode !== 'qr' && mode !== 'barcode') {
+        return;
+      }
+
+      if (isProcessingRef.current) {
+        return;
+      }
+      isProcessingRef.current = true;
+
+      try {
+        const now = Date.now();
+
+        // 🔁 Aynı kodu 3 saniye içinde tekrar görürsek yok say
+        if (
+          value === lastScannedCode &&
+          lastScanTimeRef.current !== null &&
+          now - lastScanTimeRef.current < 3000
+        ) {
+          return;
+        }
+
+        setLastScannedCode(value);
+        lastScanTimeRef.current = now;
+
+        // 1) History'e kaydet
+        addItem(mode, value);
+
+        // 2) Titreşim
+        Vibration.vibrate(150);
+
+        // 3) Üstten telefon bildirimi
+        await showNotification(
+          mode === 'qr' ? 'QR Kod Okundu' : 'Barkod Okundu',
+          value,
+        );
+      } finally {
+        // İşlem bitti, yeni okumalara izin ver
+        isProcessingRef.current = false;
+      }
     },
   });
+
+  useEffect(() => {
+    notifee.requestPermission();
+  }, []);
 
   // Uygulama açılırken sadece mevcut izin durumunu kontrol et
   useEffect(() => {
@@ -202,10 +250,13 @@ const HomeScreen: React.FC<Props> = ({ navigation, route }) => {
             } else {
               // Metin bulundu → History'ye yaz
               addItem('document', extractedText);
-              Alert.alert(
-                'Belge okundu',
-                'Belgenin üzerindeki metin History’e kaydedildi.',
+              Vibration.vibrate(200);
+
+              await showNotification(
+                'Belge Okundu',
+                'Belge başarıyla tarandı ve geçmişe kaydedildi.'
               );
+
             }
           } catch (e) {
             console.error('OCR API hata:', e);
@@ -219,36 +270,20 @@ const HomeScreen: React.FC<Props> = ({ navigation, route }) => {
           // document modu için akış burada bitiyor, diğer "else if (mode === 'qr' ...)" kısmına düşmesin
           return;
         }
-
-        else if (mode === 'qr' || mode === 'barcode') {
-        // QR / Barkod modu: o anda taranan kodu history'e kaydet
-          if (!lastScannedCode) {
-            Alert.alert(
-              'Kod Bulunamadı',
-              'Çerçeve içinde bir QR veya barkod yok gibi görünüyor.'
-            );
-          } else {
-            addItem(mode, lastScannedCode);
-
-            Alert.alert(
-              mode === 'qr' ? 'QR Kaydedildi' : 'Barkod Kaydedildi',
-              lastScannedCode
-            );
-
-          // İstersen aynı kodu tekrar kaydetmemek için sıfırlayabilirsin
-            setLastScannedCode(null);
-          }
-        }
       } catch (error) {
         console.error(error);
         Alert.alert('Hata', 'Görsel alınırken bir hata oluştu.');
       } finally {
         setIsCapturing(false);
       }
-    },
-    [addItem, device, hasPermission, mode, lastScannedCode]
-  );
+  }, [addItem, device, hasPermission, mode]);
+  
+  
+  const handleToggleModeMenu = useCallback(() => {
+    setIsModeMenuVisible((prev) => !prev);
+  }, []);
 
+          
   const getModeTitle = () => {
     switch (mode) {
       case 'qr':
@@ -345,10 +380,42 @@ const HomeScreen: React.FC<Props> = ({ navigation, route }) => {
 
       {/* Çekim butonu */}
       <View style={styles.bottomControls}>
+        {isModeMenuVisible && (
+          <View style={styles.modeMenu}>
+            {[
+              { key: 'qr' as ScanMode, label: 'QR' },
+              { key: 'barcode' as ScanMode, label: 'Barkod' },
+              { key: 'document' as ScanMode, label: 'Belge' },
+            ].map((option) => (
+              <TouchableOpacity
+                key={option.key}
+                onPress={() => {
+                  setMode(option.key);
+                  setIsModeMenuVisible(false);
+                }}
+                style={[
+                  styles.modeMenuItem,
+                  mode === option.key && styles.modeMenuItemActive,
+                ]}
+              >
+                <Text
+                  style={[
+                    styles.modeMenuItemText,
+                    mode === option.key && styles.modeMenuItemTextActive,
+                  ]}
+                >
+                  {option.label}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        )}
         <TouchableOpacity
           style={[styles.captureButton, isCapturing && { opacity: 0.6 }]}
           disabled={isCapturing}
           onPress={handleCapture}
+          onLongPress={handleToggleModeMenu} // UZUN BAS: menüyü aç/kapa
+          delayLongPress={400}             // 0.4 sn basılı tut
         >
           <View style={styles.innerCapture} />
         </TouchableOpacity>
@@ -431,6 +498,7 @@ const styles = StyleSheet.create({
     justifyContent: 'flex-end',
     alignItems: 'center',
     paddingBottom: 40,
+    position: 'relative',
   },
   captureButton: {
     width: 80,
@@ -447,4 +515,38 @@ const styles = StyleSheet.create({
     borderRadius: 28,
     backgroundColor: '#FFB100',
   },
+  modeMenu: {
+    position: 'absolute',
+    bottom: 125,              // butonun biraz üstünde
+    alignSelf: 'center',
+    flexDirection: 'row',
+    backgroundColor: '#fff',
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    elevation: 4,
+    shadowColor: '#000',
+    shadowOpacity: 0.15,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+},
+  modeMenuItem: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    backgroundColor: '#f0f0f0',
+    marginHorizontal: 4,
+  },
+  modeMenuItemActive: {
+    backgroundColor: '#FFB100',
+  },
+  modeMenuItemText: {
+    fontSize: 13,
+    color: '#333',
+  },
+  modeMenuItemTextActive: {
+    color: '#000',
+    fontWeight: '600',
+  },
+
 });

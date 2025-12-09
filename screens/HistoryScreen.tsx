@@ -43,13 +43,13 @@ const HistoryScreen = () => {
   };
 
   const handleItemPress = (item: HistoryItem) => {
-    if (item.type === 'document') {
+    if (item.type === 'document' || item.type === 'barcode') {
       // 📄 Belge: detay modalı aç
       setSelectedItem(item);
       return;
     }
 
-    // 🔗 QR / Barkod: linke git
+    // 🔗 QR: linke git
     const raw = item.value.trim();
 
     // basit bir URL normalizasyonu
